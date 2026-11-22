@@ -1,0 +1,240 @@
+Index: micropython/py/gc.c
+===================================================================
+--- micropython.orig/py/gc.c
++++ micropython/py/gc.c
+@@ -32,6 +32,13 @@
+ #include "py/gc.h"
+ #include "py/runtime.h"
+ 
++// USB CDC trace of the automatic threshold check. ESP-IDF only: mpy-cross
++// and host ports do not compile this, and the writer lives in the ESP32 port.
++#if defined(ESP_PLATFORM)
++#include <stdint.h>
++#include "esp_timer.h"
++#endif
++
+ #if MICROPY_DEBUG_VALGRIND
+ #include <valgrind/memcheck.h>
+ #endif
+@@ -757,6 +764,126 @@
+     GC_EXIT();
+ }
+ 
++#if defined(ESP_PLATFORM) && MICROPY_GC_ALLOC_THRESHOLD
++// "no" samples are capped near this period. "yes" is always logged.
++// Milestones and the first sample after USB CDC is up are extra.
++#define GC_THRESH_LOG_SAMPLE_US (150000)
++// Smallest quarter-threshold that is worth a milestone line (4096 bytes).
++#define GC_THRESH_LOG_MIN_STEP (256)
++
++extern int mp_hal_gc_log_ready(void);
++extern void mp_hal_gc_log_write(const char *str, size_t len);
++
++static uint64_t gc_log_last_us;
++static size_t gc_log_last_mark;
++static size_t gc_log_step_used;
++static int gc_log_boot_sent;
++
++static void gc_log_putc(char **p, char *end, char c) {
++    if (*p < end) {
++        *(*p)++ = c;
++    }
++}
++
++static void gc_log_puts(char **p, char *end, const char *s) {
++    while (*s) {
++        gc_log_putc(p, end, *s++);
++    }
++}
++
++static void gc_log_u64(char **p, char *end, uint64_t v) {
++    char tmp[20];
++    unsigned i = 0;
++    if (v == 0) {
++        gc_log_putc(p, end, '0');
++        return;
++    }
++    while (v > 0 && i < sizeof(tmp)) {
++        tmp[i++] = (char)('0' + (v % 10));
++        v /= 10;
++    }
++    while (i > 0) {
++        gc_log_putc(p, end, tmp[--i]);
++    }
++}
++
++// Quarter of the threshold, in GC blocks. Zero means "no milestone"
++// (threshold disabled, or so small that milestones would flood).
++static size_t gc_threshold_log_step(size_t threshold) {
++    if (threshold == 0 || threshold > (SIZE_MAX / 4)) {
++        return 0;
++    }
++    size_t quarter = threshold / 4;
++    if (quarter < GC_THRESH_LOG_MIN_STEP) {
++        return 0;
++    }
++    return quarter;
++}
++
++// fired == 0: sample. fired != 0: the gc_alloc threshold comparison triggered gc_collect.
++// decision_us is the timestamp of that comparison; dur_us is gc_collect time.
++// amount/threshold are the values used by the comparison. gc_collect clears
++// gc_alloc_amount, so the "yes" line must be given the pre-collect values.
++static void gc_threshold_log(int fired, size_t amount, size_t threshold, uint64_t decision_us, uint64_t dur_us) {
++    if (!mp_hal_gc_log_ready()) {
++        return;
++    }
++
++    uint64_t now = fired ? decision_us : (uint64_t)esp_timer_get_time();
++    size_t step = gc_threshold_log_step(threshold);
++    if (step != gc_log_step_used) {
++        gc_log_step_used = step;
++        gc_log_last_mark = 0;
++    }
++    size_t mark = step ? (amount / step) : 0;
++    int milestone = !fired && step && mark > gc_log_last_mark;
++    int due = !gc_log_boot_sent || (now - gc_log_last_us) >= GC_THRESH_LOG_SAMPLE_US;
++    if (!fired && !milestone && !due) {
++        return;
++    }
++
++    // Stack buffer only. No snprintf, no heap, no Python.
++    char buf[160];
++    char *p = buf;
++    char *end = buf + sizeof(buf) - 2;
++    uint64_t amount_bytes = (uint64_t)amount * (uint64_t)MICROPY_BYTES_PER_GC_BLOCK;
++    uint64_t threshold_bytes = (uint64_t)threshold * (uint64_t)MICROPY_BYTES_PER_GC_BLOCK;
++    gc_log_puts(&p, end, "pause gcamt ");
++    gc_log_u64(&p, end, now);
++    gc_log_puts(&p, end, " amt=");
++    gc_log_u64(&p, end, (uint64_t)amount);
++    gc_log_putc(&p, end, '(');
++    gc_log_u64(&p, end, amount_bytes);
++    gc_log_puts(&p, end, "B) thr=");
++    gc_log_u64(&p, end, (uint64_t)threshold);
++    gc_log_putc(&p, end, '(');
++    gc_log_u64(&p, end, threshold_bytes);
++    gc_log_puts(&p, end, "B) fire=");
++    gc_log_puts(&p, end, fired ? "yes" : "no");
++    if (fired) {
++        gc_log_puts(&p, end, " dur=");
++        gc_log_u64(&p, end, dur_us);
++        gc_log_puts(&p, end, "us");
++    }
++    gc_log_putc(&p, end, '\n');
++    *p = '\0';
++
++    // Same lock drop gc_collect uses. On the GIL port GC_ENTER/GC_EXIT are
++    // empty; the GIL stays held. The write itself must not allocate.
++    GC_EXIT();
++    mp_hal_gc_log_write(buf, (size_t)(p - buf));
++    GC_ENTER();
++
++    gc_log_boot_sent = 1;
++    gc_log_last_us = now;
++    if (fired) {
++        gc_log_last_mark = 0;
++    } else if (mark > gc_log_last_mark) {
++        gc_log_last_mark = mark;
++    }
++}
++#endif
++
+ void *gc_alloc(size_t n_bytes, unsigned int alloc_flags) {
+     bool has_finaliser = alloc_flags & GC_ALLOC_FLAG_HAS_FINALISER;
+     size_t n_blocks = ((n_bytes + BYTES_PER_BLOCK - 1) & (~(BYTES_PER_BLOCK - 1))) / BYTES_PER_BLOCK;
+@@ -786,11 +913,27 @@
+ 
+     #if MICROPY_GC_ALLOC_THRESHOLD
+     if (!collected && MP_STATE_MEM(gc_alloc_amount) >= MP_STATE_MEM(gc_alloc_threshold)) {
++        #if defined(ESP_PLATFORM)
++        size_t gc_log_amount = MP_STATE_MEM(gc_alloc_amount);
++        size_t gc_log_threshold = MP_STATE_MEM(gc_alloc_threshold);
++        uint64_t gc_log_t0 = (uint64_t)esp_timer_get_time();
++        #endif
+         GC_EXIT();
+         gc_collect();
++        #if defined(ESP_PLATFORM)
++        uint64_t gc_log_dur = (uint64_t)esp_timer_get_time() - gc_log_t0;
++        #endif
+         collected = 1;
+         GC_ENTER();
++        #if defined(ESP_PLATFORM)
++        gc_threshold_log(1, gc_log_amount, gc_log_threshold, gc_log_t0, gc_log_dur);
++        #endif
+     }
++    #if defined(ESP_PLATFORM)
++    else if (!collected) {
++        gc_threshold_log(0, MP_STATE_MEM(gc_alloc_amount), MP_STATE_MEM(gc_alloc_threshold), 0, 0);
++    }
++    #endif
+     #endif
+ 
+     for (;;) {
+Index: micropython/ports/esp32/mphalport.c
+===================================================================
+--- micropython.orig/ports/esp32/mphalport.c
++++ micropython/ports/esp32/mphalport.c
+@@ -142,6 +142,44 @@
+     }
+ }
+ 
++int mp_hal_gc_log_ready(void) {
++    #if MICROPY_HW_USB_CDC && !defined(NO_QSTR)
++    return tusb_inited();
++    #else
++    return 0;
++    #endif
++}
++
++void mp_hal_gc_log_write(const char *str, size_t len) {
++    // Direct TinyUSB CDC FIFO write. mp_hal_stdout_tx_strn() is not safe here:
++    // it calls dupterm (Python) and mp_usbd_cdc_tx_strn() can block in
++    // mp_event_wait_ms(), which runs the scheduler. gc_alloc() is on the
++    // MicroPython task with the GIL held, the same context as a normal print,
++    // but it must not re-enter the allocator.
++    #if MICROPY_HW_USB_CDC && !defined(NO_QSTR)
++    if (!tusb_inited() || str == NULL || len == 0) {
++        return;
++    }
++    uint32_t avail = tud_cdc_write_available();
++    if (avail < len) {
++        // One non-blocking flush in case a short packet is sitting in the FIFO.
++        // Do not wait for the host; drop the line if it still does not fit.
++        tud_cdc_write_flush();
++        avail = tud_cdc_write_available();
++        if (avail < len) {
++            return;
++        }
++    }
++    uint32_t wrote = tud_cdc_write(str, (uint32_t)len);
++    if (wrote > 0) {
++        tud_cdc_write_flush();
++    }
++    #else
++    (void)str;
++    (void)len;
++    #endif
++}
++
+ mp_uint_t mp_hal_stdout_tx_strn(const char *str, size_t len) {
+     // Only release the GIL if many characters are being sent
+     mp_uint_t ret = len;
+Index: micropython/ports/esp32/mphalport.h
+===================================================================
+--- micropython.orig/ports/esp32/mphalport.h
++++ micropython/ports/esp32/mphalport.h
+@@ -111,6 +111,13 @@
+ void mp_hal_wake_main_task(void);
+ void mp_hal_wake_main_task_from_isr(void);
+ 
++// Non-allocating USB CDC write for the GC threshold trace in py/gc.c.
++// mp_hal_gc_log_ready() is true only after TinyUSB is initialised.
++// mp_hal_gc_log_write() copies into the CDC FIFO and flushes. It does not
++// allocate, call into Python, wait on the host, or run the scheduler.
++int mp_hal_gc_log_ready(void);
++void mp_hal_gc_log_write(const char *str, size_t len);
++
+ // C-level pin HAL
+ #include "py/obj.h"
+ #include "driver/gpio.h"
