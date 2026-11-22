@@ -372,7 +372,8 @@ MICROPYTHON_PATCH_SERIES = \
 	0029-micropython-1.27.0-select-esp32p4-usb-phy.patch \
 	0030-micropython-1.27.0-fix-nimble-dynamic-gatt.patch \
 	0031-micropython-1.27.0-support-esp32c61.patch \
-	0032-micropython-1.27.0-fix-esp-hosted-ble-lifecycle.patch
+	0032-micropython-1.27.0-fix-esp-hosted-ble-lifecycle.patch \
+	0033-micropython-1.27.0-log-gc-alloc-threshold.patch
 
 IDF_PATH_PATCH_SERIES = \
 	1005-idf_v5.5_freertos.patch
