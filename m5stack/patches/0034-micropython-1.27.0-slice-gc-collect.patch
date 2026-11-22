@@ -1,0 +1,1368 @@
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/ports/esp32/gccollect.c /agent/repos/uiflow-micropython/micropython/ports/esp32/gccollect.c
+--- micropython.orig/ports/esp32/gccollect.c
++++ micropython/ports/esp32/gccollect.c
+@@ -52,25 +52,51 @@
+     }
+ }
+ 
++#if MICROPY_GC_INCREMENTAL
++static void gc_incremental_port_roots(void) {
++    gc_collect_inner(0);
++    #if MICROPY_PY_THREAD
++    mp_thread_gc_others();
++    #endif
++}
++#endif
++
+ void gc_collect(void) {
++    #if MICROPY_GC_INCREMENTAL
++    gc_incremental_collect(gc_incremental_port_roots);
++    #else
+     gc_collect_start();
+     gc_collect_inner(0);
+     #if MICROPY_PY_THREAD
+     mp_thread_gc_others();
+     #endif
+     gc_collect_end();
++    #endif
+ }
+ 
+ #elif CONFIG_IDF_TARGET_ARCH_RISCV
+ #include "shared/runtime/gchelper.h"
+ 
++#if MICROPY_GC_INCREMENTAL
++static void gc_incremental_port_roots(void) {
++    gc_helper_collect_regs_and_stack();
++    #if MICROPY_PY_THREAD
++    mp_thread_gc_others();
++    #endif
++}
++#endif
++
+ void gc_collect(void) {
++    #if MICROPY_GC_INCREMENTAL
++    gc_incremental_collect(gc_incremental_port_roots);
++    #else
+     gc_collect_start();
+     gc_helper_collect_regs_and_stack();
+     #if MICROPY_PY_THREAD
+     mp_thread_gc_others();
+     #endif
+     gc_collect_end();
++    #endif
+ }
+ 
+ #else
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/ports/esp32/mpconfigport.h /agent/repos/uiflow-micropython/micropython/ports/esp32/mpconfigport.h
+--- micropython.orig/ports/esp32/mpconfigport.h
++++ micropython/ports/esp32/mpconfigport.h
+@@ -303,12 +303,24 @@
+ #define MICROPY_PY_SOCKET_EVENTS_HANDLER
+ #endif
+ 
++#if MICROPY_GC_INCREMENTAL
++#define MICROPY_GC_SLICE_POLL \
++    do { \
++        extern void gc_incremental_poll(void); \
++        gc_incremental_poll(); \
++    } while (0)
++#define MICROPY_VM_HOOK_LOOP MICROPY_GC_SLICE_POLL;
++#else
++#define MICROPY_GC_SLICE_POLL
++#endif
++
+ #if MICROPY_PY_THREAD
+ #define MICROPY_EVENT_POLL_HOOK \
+     do { \
+         extern void mp_handle_pending(bool); \
+         mp_handle_pending(true); \
+         MICROPY_PY_SOCKET_EVENTS_HANDLER \
++        MICROPY_GC_SLICE_POLL; \
+         MP_THREAD_GIL_EXIT(); \
+         ulTaskNotifyTake(pdFALSE, 1); \
+         MP_THREAD_GIL_ENTER(); \
+@@ -324,7 +336,8 @@
+         extern void mp_handle_pending(bool); \
+         mp_handle_pending(true); \
+         MICROPY_PY_SOCKET_EVENTS_HANDLER \
+-            MICROPY_PY_WAIT_FOR_INTERRUPT; \
++        MICROPY_GC_SLICE_POLL; \
++        MICROPY_PY_WAIT_FOR_INTERRUPT; \
+     } while (0);
+ #endif
+ 
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/ports/unix/gccollect.c /agent/repos/uiflow-micropython/micropython/ports/unix/gccollect.c
+--- micropython.orig/ports/unix/gccollect.c
++++ micropython/ports/unix/gccollect.c
+@@ -33,13 +33,26 @@
+ 
+ #if MICROPY_ENABLE_GC
+ 
++#if MICROPY_GC_INCREMENTAL
++static void gc_incremental_port_roots(void) {
++    gc_helper_collect_regs_and_stack();
++    #if MICROPY_PY_THREAD
++    mp_thread_gc_others();
++    #endif
++}
++#endif
++
+ void gc_collect(void) {
++    #if MICROPY_GC_INCREMENTAL
++    gc_incremental_collect(gc_incremental_port_roots);
++    #else
+     gc_collect_start();
+     gc_helper_collect_regs_and_stack();
+     #if MICROPY_PY_THREAD
+     mp_thread_gc_others();
+     #endif
+     gc_collect_end();
++    #endif
+ }
+ 
+ #endif // MICROPY_ENABLE_GC
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/ports/unix/mpconfigport.h /agent/repos/uiflow-micropython/micropython/ports/unix/mpconfigport.h
+--- micropython.orig/ports/unix/mpconfigport.h
++++ micropython/ports/unix/mpconfigport.h
+@@ -226,3 +226,11 @@
+ #ifndef MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
+ #define MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS (MICROPY_BLUETOOTH_NIMBLE)
+ #endif
++
++#if MICROPY_GC_INCREMENTAL
++#define MICROPY_VM_HOOK_LOOP \
++    do { \
++        extern void gc_incremental_poll(void); \
++        gc_incremental_poll(); \
++    } while (0);
++#endif
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/bc.c /agent/repos/uiflow-micropython/micropython/py/bc.c
+--- micropython.orig/py/bc.c
++++ micropython/py/bc.c
+@@ -232,7 +232,7 @@
+             }
+             mp_map_elem_t *elem = mp_map_lookup(mp_obj_dict_get_map(dict), wanted_arg_name, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND);
+             if (elem->value == MP_OBJ_NULL) {
+-                elem->value = kwargs[2 * i + 1];
++                GC_STORE(elem->value, kwargs[2 * i + 1]);
+             } else {
+                 goto error_multiple;
+             }
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/gc.c /agent/repos/uiflow-micropython/micropython/py/gc.c
+--- micropython.orig/py/gc.c
++++ micropython/py/gc.c
+@@ -28,6 +28,12 @@
+ #include <assert.h>
+ #include <stdio.h>
+ #include <string.h>
++#if MICROPY_GC_INCREMENTAL && !defined(ESP_PLATFORM)
++#include <time.h>
++#endif
++#if MICROPY_GC_INCREMENTAL && MICROPY_GC_INCREMENTAL_VERIFY
++#include <stdlib.h>
++#endif
+ 
+ #include "py/gc.h"
+ #include "py/runtime.h"
+@@ -45,6 +51,38 @@
+ 
+ #if MICROPY_ENABLE_GC
+ 
++#if MICROPY_GC_INCREMENTAL
++// Defined for the inline barrier in py/obj.h. 1 while marking, 2 while sweeping.
++volatile uint8_t mp_gc_phase;
++static uint8_t mp_gc_slice_force;
++static uint8_t mp_gc_slice_stall;
++static uint8_t mp_gc_slice_busy;
++static uint8_t mp_gc_slice_div;
++static size_t gc_mark_sp;
++static size_t gc_budget_ticks;
++static int gc_partial_active;
++static size_t gc_partial_block;
++static size_t gc_partial_word;
++static mp_state_mem_area_t *gc_partial_area;
++static int gc_ovf_active;
++static size_t gc_ovf_block;
++static mp_state_mem_area_t *gc_ovf_area;
++static mp_state_mem_area_t *gc_sweep_area;
++static mp_state_mem_area_t *gc_sweep_prev;
++static size_t gc_sweep_block;
++static int gc_sweep_free_tail;
++static size_t gc_sweep_last_used;
++static uint32_t gc_slice_count;
++static uint32_t gc_mark_us_acc;
++static uint32_t gc_sweep_us_acc;
++static uint64_t gc_slice_last_us;
++static uint64_t gc_slice_log_us;
++static void gc_gray_push(mp_state_mem_area_t *area, size_t block);
++static void gc_incremental_note_alloc(mp_state_mem_area_t *area, size_t start_block, size_t end_block);
++static void gc_collect_full_now(void);
++static void gc_incremental_abandon(void);
++#endif
++
+ #if MICROPY_DEBUG_VERBOSE // print debugging info
+ #define DEBUG_PRINT (1)
+ #define DEBUG_printf DEBUG_printf
+@@ -447,6 +485,13 @@
+         if (ATB_GET_KIND(area, block) == AT_HEAD) {
+             // An unmarked head: mark it, and mark all its children
+             ATB_HEAD_TO_MARK(area, block);
++            #if MICROPY_GC_INCREMENTAL
++            if (mp_gc_phase == 1) {
++                // A slice is open. Trace this object later so the mutator can run.
++                gc_gray_push(area, block);
++                continue;
++            }
++            #endif
+             #if MICROPY_GC_SPLIT_HEAP
+             gc_mark_subtree(area, block);
+             #else
+@@ -535,6 +580,10 @@
+ }
+ 
+ void gc_sweep_all(void) {
++    #if MICROPY_GC_INCREMENTAL
++    // Soft reset. Drop a half-finished mark so the stock sweep sees heads.
++    gc_incremental_abandon();
++    #endif
+     gc_collect_start_common();
+     gc_collect_end();
+ }
+@@ -724,7 +773,10 @@
+                     break;
+ 
+                 case AT_MARK:
+-                    // shouldn't happen
++                    // A sliced collection can be in progress while Python asks.
++                    // The block is still live; sweep has not reclaimed it.
++                    info->used += 1;
++                    len = 1;
+                     break;
+             }
+ 
+@@ -919,7 +971,12 @@
+         uint64_t gc_log_t0 = (uint64_t)esp_timer_get_time();
+         #endif
+         GC_EXIT();
++        #if MICROPY_GC_INCREMENTAL
++        // Threshold collections stay whole so the gcamt dur= line is the full walk.
++        gc_collect_full_now();
++        #else
+         gc_collect();
++        #endif
+         #if defined(ESP_PLATFORM)
+         uint64_t gc_log_dur = (uint64_t)esp_timer_get_time() - gc_log_t0;
+         #endif
+@@ -971,6 +1028,16 @@
+         GC_EXIT();
+         // nothing found!
+         if (collected) {
++            #if MICROPY_GC_INCREMENTAL
++            // Auto-collect is off, or a full collect already ran. A sliced
++            // cycle may still be holding garbage; finish it once, then retry.
++            if (mp_gc_phase != 0) {
++                gc_collect_full_now();
++                collected = !MP_STATE_MEM(gc_auto_collect_enabled);
++                GC_ENTER();
++                continue;
++            }
++            #endif
+             #if MICROPY_GC_SPLIT_HEAP_AUTO
+             if (!added && gc_try_add_heap(n_bytes)) {
+                 added = true;
+@@ -980,7 +1047,11 @@
+             return NULL;
+         }
+         DEBUG_printf("gc_alloc(" UINT_FMT "): no free mem, triggering GC\n", n_bytes);
++        #if MICROPY_GC_INCREMENTAL
++        gc_collect_full_now();
++        #else
+         gc_collect();
++        #endif
+         collected = 1;
+         GC_ENTER();
+     }
+@@ -1014,6 +1085,12 @@
+         ATB_FREE_TO_TAIL(area, bl);
+     }
+ 
++    #if MICROPY_GC_INCREMENTAL
++    // During a sweep, a new head in the not-yet-swept region must look marked
++    // or the rest of this cycle will free it.
++    gc_incremental_note_alloc(area, start_block, end_block);
++    #endif
++
+     // get pointer to first block
+     // we must create this pointer before unlocking the GC so a collection can find it
+     void *ret_ptr = (void *)(area->gc_pool_start + start_block * BYTES_PER_BLOCK);
+@@ -1092,7 +1169,12 @@
+ 
+     size_t block = BLOCK_FROM_PTR(area, ptr);
+     assert(ATB_GET_KIND(area, block) == AT_HEAD
+-        || (ATB_GET_KIND(area, block) == AT_MARK && (MP_STATE_THREAD(gc_lock_depth) & GC_COLLECT_FLAG)));
++        || (ATB_GET_KIND(area, block) == AT_MARK && (
++            (MP_STATE_THREAD(gc_lock_depth) & GC_COLLECT_FLAG)
++            #if MICROPY_GC_INCREMENTAL
++            || mp_gc_phase != 0
++            #endif
++            )));
+ 
+     #if MICROPY_ENABLE_FINALISER
+     FTB_CLEAR(area, block);
+@@ -1147,7 +1229,9 @@
+ 
+     if (area) {
+         size_t block = BLOCK_FROM_PTR(area, ptr);
+-        if (ATB_GET_KIND(area, block) == AT_HEAD) {
++        size_t kind = ATB_GET_KIND(area, block);
++        // AT_MARK is a live head while a sliced collection is open.
++        if (kind == AT_HEAD || kind == AT_MARK) {
+             // work out number of consecutive blocks in the chain starting with this on
+             size_t n_blocks = 0;
+             do {
+@@ -1193,7 +1277,11 @@
+     area = &MP_STATE_MEM(area);
+     #endif
+     size_t block = BLOCK_FROM_PTR(area, ptr);
+-    assert(ATB_GET_KIND(area, block) == AT_HEAD);
++    assert(ATB_GET_KIND(area, block) == AT_HEAD
++        #if MICROPY_GC_INCREMENTAL
++        || (mp_gc_phase != 0 && ATB_GET_KIND(area, block) == AT_MARK)
++        #endif
++        );
+ 
+     // compute number of new blocks that are requested
+     size_t new_blocks = (n_bytes + BYTES_PER_BLOCK - 1) / BYTES_PER_BLOCK;
+@@ -1269,6 +1357,10 @@
+ 
+         area->gc_last_used_block = MAX(area->gc_last_used_block, end_block);
+ 
++        #if MICROPY_GC_INCREMENTAL
++        gc_incremental_note_alloc(area, block, end_block - 1);
++        #endif
++
+         GC_EXIT();
+ 
+         #if MICROPY_GC_CONSERVATIVE_CLEAR
+@@ -1455,4 +1547,573 @@
+     GC_EXIT();
+ }
+ 
++#if MICROPY_GC_INCREMENTAL
++
++// Explicit gc.collect() does one short slice and returns. The VM hook keeps
++// going until the mark is closed and the sweep finishes. A Dijkstra barrier
++// (shade the newly stored pointer) lets the mutator run during the mark.
++// Allocations during the sweep are born marked when the sweeper has not
++// reached them yet, so they are not treated as garbage.
++//
++// gc_alloc's threshold and out-of-memory paths call gc_collect_full_now()
++// and still run the cycle to the end. That is what the gcamt "fire=yes"
++// duration measures.
++
++static uint64_t gc_now_us(void) {
++    #if defined(ESP_PLATFORM)
++    return (uint64_t)esp_timer_get_time();
++    #else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000ULL);
++    #endif
++}
++
++static bool gc_budget_exhausted(uint64_t t0) {
++    if (mp_gc_slice_force) {
++        return false;
++    }
++    // Copy through volatile so a test build can set either budget to 0
++    // without -Werror=type-limits on a constant compare.
++    volatile uint32_t block_budget = MICROPY_GC_SLICE_BUDGET_BLOCKS;
++    volatile uint32_t time_budget = MICROPY_GC_SLICE_BUDGET_US;
++    if (block_budget != 0 && gc_budget_ticks >= block_budget) {
++        return true;
++    }
++    if (time_budget != 0 && gc_budget_ticks != 0 && (gc_budget_ticks & 15) == 0) {
++        if ((gc_now_us() - t0) >= (uint64_t)time_budget) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void gc_budget_tick(void) {
++    if (!mp_gc_slice_force && gc_budget_ticks != (size_t)-1) {
++        gc_budget_ticks++;
++    }
++}
++
++static void gc_gray_push(mp_state_mem_area_t *area, size_t block) {
++    if (gc_mark_sp < MICROPY_ALLOC_GC_STACK_SIZE) {
++        MP_STATE_MEM(gc_block_stack)[gc_mark_sp] = (MICROPY_GC_STACK_ENTRY_TYPE)block;
++        #if MICROPY_GC_SPLIT_HEAP
++        MP_STATE_MEM(gc_area_stack)[gc_mark_sp] = area;
++        #else
++        (void)area;
++        #endif
++        gc_mark_sp++;
++    } else {
++        MP_STATE_MEM(gc_stack_overflow) = 1;
++    }
++}
++
++static void gc_shade_ptr(void *ptr) {
++    #if MICROPY_GC_SPLIT_HEAP
++    mp_state_mem_area_t *area = gc_get_ptr_area(ptr);
++    if (area == NULL) {
++        return;
++    }
++    #else
++    if (!VERIFY_PTR(ptr)) {
++        return;
++    }
++    mp_state_mem_area_t *area = &MP_STATE_MEM(area);
++    #endif
++    size_t block = BLOCK_FROM_PTR(area, ptr);
++    if (ATB_GET_KIND(area, block) != AT_HEAD) {
++        return;
++    }
++    ATB_HEAD_TO_MARK(area, block);
++    gc_gray_push(area, block);
++}
++
++void gc_write_barrier_slow(mp_obj_t o) {
++    // Phase is re-checked. The inline caller only enters while marking,
++    // but a nested collection may have finished before we run.
++    if (mp_gc_phase != 1) {
++        return;
++    }
++    gc_shade_ptr((void *)(uintptr_t)o);
++}
++
++// True when this block has already been visited by the current sweep.
++static bool gc_block_was_swept(mp_state_mem_area_t *area, size_t block) {
++    if (gc_sweep_area == NULL) {
++        return false;
++    }
++    for (mp_state_mem_area_t *p = &MP_STATE_MEM(area); p != NULL; p = NEXT_AREA(p)) {
++        if (p == area) {
++            if (p == gc_sweep_area) {
++                return block < gc_sweep_block;
++            }
++            return true;
++        }
++        if (p == gc_sweep_area) {
++            return false;
++        }
++    }
++    return false;
++}
++
++static void gc_incremental_note_alloc(mp_state_mem_area_t *area, size_t start_block, size_t end_block) {
++    if (mp_gc_phase != 2 || start_block > end_block) {
++        return;
++    }
++    bool start_swept = gc_block_was_swept(area, start_block);
++    bool end_swept = gc_block_was_swept(area, end_block);
++    if (!start_swept) {
++        if (ATB_GET_KIND(area, start_block) == AT_HEAD) {
++            ATB_HEAD_TO_MARK(area, start_block);
++        }
++    } else if (!end_swept) {
++        // The head is already behind the cursor and the tail is not.
++        // Keep the unswept tail blocks.
++        gc_sweep_free_tail = 0;
++    }
++}
++
++#if defined(ESP_PLATFORM) && MICROPY_GC_ALLOC_THRESHOLD
++static void gc_slice_log(const char *ev, const char *phase, uint32_t ran_us) {
++    if (!mp_hal_gc_log_ready()) {
++        return;
++    }
++    char buf[180];
++    char *p = buf;
++    char *end = buf + sizeof(buf) - 2;
++    gc_log_puts(&p, end, "pause gcsli ");
++    gc_log_u64(&p, end, (uint64_t)esp_timer_get_time());
++    gc_log_puts(&p, end, " ev=");
++    gc_log_puts(&p, end, ev);
++    gc_log_puts(&p, end, " phase=");
++    gc_log_puts(&p, end, phase);
++    gc_log_puts(&p, end, " slices=");
++    gc_log_u64(&p, end, gc_slice_count);
++    // "step" carries the slice duration. "start" does not.
++    if (ev[0] == 's' && ev[2] == 'e') {
++        gc_log_puts(&p, end, " ran=");
++        gc_log_u64(&p, end, ran_us);
++        gc_log_puts(&p, end, "us");
++    }
++    if (ev[0] == 'd') {
++        gc_log_puts(&p, end, " mark_us=");
++        gc_log_u64(&p, end, gc_mark_us_acc);
++        gc_log_puts(&p, end, " sweep_us=");
++        gc_log_u64(&p, end, gc_sweep_us_acc);
++        gc_log_puts(&p, end, " stall=");
++        gc_log_puts(&p, end, mp_gc_slice_stall ? "yes" : "no");
++    }
++    gc_log_putc(&p, end, '\n');
++    *p = '\0';
++    GC_EXIT();
++    mp_hal_gc_log_write(buf, (size_t)(p - buf));
++    GC_ENTER();
++}
++#else
++static void gc_slice_log(const char *ev, const char *phase, uint32_t ran_us) {
++    (void)ev;
++    (void)phase;
++    (void)ran_us;
++}
++#endif
++
++static void gc_incremental_begin(void) {
++    mp_gc_phase = 1;
++    gc_mark_sp = 0;
++    gc_partial_active = 0;
++    gc_ovf_active = 0;
++    gc_sweep_area = NULL;
++    gc_sweep_prev = NULL;
++    gc_sweep_block = 0;
++    gc_sweep_free_tail = 0;
++    gc_sweep_last_used = 0;
++    gc_slice_count = 0;
++    gc_mark_us_acc = 0;
++    gc_sweep_us_acc = 0;
++    mp_gc_slice_stall = mp_gc_slice_force ? 1 : 0;
++    MP_STATE_MEM(gc_stack_overflow) = 0;
++    #if MICROPY_GC_ALLOC_THRESHOLD
++    MP_STATE_MEM(gc_alloc_amount) = 0;
++    #endif
++    gc_slice_log_us = gc_now_us();
++}
++
++static void gc_incremental_finish(void) {
++    #if MICROPY_GC_SPLIT_HEAP
++    MP_STATE_MEM(gc_last_free_area) = &MP_STATE_MEM(area);
++    #endif
++    for (mp_state_mem_area_t *area = &MP_STATE_MEM(area); area != NULL; area = NEXT_AREA(area)) {
++        area->gc_last_free_atb_index = 0;
++    }
++    mp_gc_phase = 0;
++    gc_mark_sp = 0;
++    gc_partial_active = 0;
++    gc_ovf_active = 0;
++    gc_sweep_area = NULL;
++    MP_STATE_MEM(gc_stack_overflow) = 0;
++}
++
++static void gc_incremental_abandon(void) {
++    if (mp_gc_phase == 0) {
++        return;
++    }
++    for (mp_state_mem_area_t *area = &MP_STATE_MEM(area); area != NULL; area = NEXT_AREA(area)) {
++        size_t n = area->gc_alloc_table_byte_len * BLOCKS_PER_ATB;
++        if (n == 0) {
++            continue;
++        }
++        size_t last = area->gc_last_used_block;
++        if (last >= n) {
++            last = n - 1;
++        }
++        for (size_t block = 0; block <= last; block++) {
++            if (ATB_GET_KIND(area, block) == AT_MARK) {
++                ATB_MARK_TO_HEAD(area, block);
++            }
++        }
++    }
++    mp_gc_phase = 0;
++    gc_mark_sp = 0;
++    gc_partial_active = 0;
++    gc_ovf_active = 0;
++    gc_sweep_area = NULL;
++    MP_STATE_MEM(gc_stack_overflow) = 0;
++}
++
++static void gc_incremental_scan_vm_roots(void) {
++    void **ptrs = (void **)(void *)&mp_state_ctx;
++    size_t root_start = offsetof(mp_state_ctx_t, thread.dict_locals);
++    size_t root_end = offsetof(mp_state_ctx_t, vm.qstr_last_chunk);
++    gc_collect_root(ptrs + root_start / sizeof(void *), (root_end - root_start) / sizeof(void *));
++    #if MICROPY_ENABLE_PYSTACK
++    ptrs = (void **)(void *)MP_STATE_THREAD(pystack_start);
++    gc_collect_root(ptrs, (MP_STATE_THREAD(pystack_cur) - MP_STATE_THREAD(pystack_start)) / sizeof(void *));
++    #endif
++}
++
++// Trace one marked block. Returns true if the slice budget ran out midway.
++static bool gc_trace_block(mp_state_mem_area_t *area, size_t block, size_t start_word, uint64_t t0) {
++    if (ATB_GET_KIND(area, block) != AT_MARK) {
++        gc_partial_active = 0;
++        return false;
++    }
++    size_t n_blocks = 0;
++    do {
++        n_blocks += 1;
++    } while (ATB_GET_KIND(area, block + n_blocks) == AT_TAIL);
++
++    void **ptrs = (void **)PTR_FROM_BLOCK(area, block);
++    size_t nptrs = n_blocks * (BYTES_PER_BLOCK / sizeof(void *));
++    for (size_t i = start_word; i < nptrs; i++) {
++        MICROPY_GC_HOOK_LOOP(i);
++        gc_shade_ptr(ptrs[i]);
++        gc_budget_tick();
++        if (gc_budget_exhausted(t0) && (i + 1) < nptrs) {
++            gc_partial_area = area;
++            gc_partial_block = block;
++            gc_partial_word = i + 1;
++            gc_partial_active = 1;
++            return true;
++        }
++    }
++    gc_partial_active = 0;
++    return false;
++}
++
++static void gc_overflow_advance(uint64_t t0) {
++    if (!gc_ovf_active) {
++        if (!MP_STATE_MEM(gc_stack_overflow)) {
++            return;
++        }
++        MP_STATE_MEM(gc_stack_overflow) = 0;
++        gc_ovf_active = 1;
++        gc_ovf_area = &MP_STATE_MEM(area);
++        gc_ovf_block = 0;
++    }
++    mp_state_mem_area_t *area = gc_ovf_area;
++    if (area == NULL) {
++        gc_ovf_active = 0;
++        return;
++    }
++    size_t n = area->gc_alloc_table_byte_len * BLOCKS_PER_ATB;
++    size_t b = gc_ovf_block;
++    size_t skipped = 0;
++    while (b < n && ATB_GET_KIND(area, b) != AT_MARK && skipped < 64) {
++        b++;
++        skipped++;
++    }
++    if (b >= n) {
++        gc_ovf_area = NEXT_AREA(area);
++        gc_ovf_block = 0;
++        if (gc_ovf_area == NULL) {
++            gc_ovf_active = 0;
++        }
++        return;
++    }
++    // Same slicer as the gray stack. Partial state owns a block that did not finish.
++    if (!gc_trace_block(area, b, 0, t0)) {
++        gc_ovf_block = b + 1;
++    }
++}
++
++#if MICROPY_GC_INCREMENTAL_VERIFY
++static void gc_verify_mark_closure(void) {
++    for (mp_state_mem_area_t *area = &MP_STATE_MEM(area); area != NULL; area = NEXT_AREA(area)) {
++        size_t n = area->gc_alloc_table_byte_len * BLOCKS_PER_ATB;
++        if (n == 0) {
++            continue;
++        }
++        size_t last = area->gc_last_used_block;
++        if (last >= n) {
++            last = n - 1;
++        }
++        for (size_t block = 0; block <= last; block++) {
++            if (ATB_GET_KIND(area, block) != AT_MARK) {
++                continue;
++            }
++            size_t n_blocks = 0;
++            do {
++                n_blocks += 1;
++            } while (ATB_GET_KIND(area, block + n_blocks) == AT_TAIL);
++            void **ptrs = (void **)PTR_FROM_BLOCK(area, block);
++            size_t nptrs = n_blocks * (BYTES_PER_BLOCK / sizeof(void *));
++            for (size_t i = 0; i < nptrs; i++) {
++                void *ptr = ptrs[i];
++                #if MICROPY_GC_SPLIT_HEAP
++                mp_state_mem_area_t *child = gc_get_ptr_area(ptr);
++                if (child == NULL) {
++                    continue;
++                }
++                #else
++                if (!VERIFY_PTR(ptr)) {
++                    continue;
++                }
++                mp_state_mem_area_t *child = &MP_STATE_MEM(area);
++                #endif
++                size_t child_block = BLOCK_FROM_PTR(child, ptr);
++                if (ATB_GET_KIND(child, child_block) == AT_HEAD) {
++                    fprintf(stderr, "gc slice verify: marked block %p points at unmarked %p\n",
++                        (void *)PTR_FROM_BLOCK(area, block), ptr);
++                    abort();
++                }
++            }
++        }
++    }
++}
++#endif
++
++static void gc_incremental_start_sweep(void) {
++    #if MICROPY_GC_INCREMENTAL_VERIFY
++    gc_verify_mark_closure();
++    #endif
++    mp_gc_phase = 2;
++    gc_sweep_area = &MP_STATE_MEM(area);
++    gc_sweep_prev = NULL;
++    gc_sweep_block = 0;
++    gc_sweep_free_tail = 0;
++    gc_sweep_last_used = 0;
++    #if MICROPY_PY_GC_COLLECT_RETVAL
++    MP_STATE_MEM(gc_collected) = 0;
++    #endif
++    // Finalisers run while the heap is still intact. They may allocate;
++    // note_alloc keeps those objects because the cursor is still at 0.
++    gc_sweep_run_finalisers();
++}
++
++static void gc_incremental_sweep(uint64_t t0) {
++    while (gc_sweep_area != NULL) {
++        mp_state_mem_area_t *area = gc_sweep_area;
++        size_t max_block = area->gc_alloc_table_byte_len * BLOCKS_PER_ATB;
++        while (max_block > 0 && gc_sweep_block <= area->gc_last_used_block && gc_sweep_block < max_block) {
++            if (gc_budget_exhausted(t0)) {
++                return;
++            }
++            size_t block = gc_sweep_block++;
++            gc_budget_tick();
++            MICROPY_GC_HOOK_LOOP(block);
++            switch (ATB_GET_KIND(area, block)) {
++                case AT_HEAD:
++                    gc_sweep_free_tail = 1;
++                    #if MICROPY_PY_GC_COLLECT_RETVAL
++                    MP_STATE_MEM(gc_collected)++;
++                    #endif
++                    MP_FALLTHROUGH
++                case AT_TAIL:
++                    if (gc_sweep_free_tail) {
++                        ATB_ANY_TO_FREE(area, block);
++                        #if CLEAR_ON_SWEEP
++                        memset((void *)PTR_FROM_BLOCK(area, block), 0, BYTES_PER_BLOCK);
++                        #endif
++                    } else {
++                        gc_sweep_last_used = block;
++                    }
++                    break;
++                case AT_MARK:
++                    ATB_MARK_TO_HEAD(area, block);
++                    gc_sweep_free_tail = 0;
++                    gc_sweep_last_used = block;
++                    break;
++                default:
++                    break;
++            }
++        }
++        if (max_block > 0 && gc_sweep_block <= area->gc_last_used_block && gc_sweep_block < max_block) {
++            return;
++        }
++        area->gc_last_used_block = gc_sweep_last_used;
++        #if MICROPY_GC_SPLIT_HEAP_AUTO
++        if (gc_sweep_last_used == 0 && gc_sweep_prev != NULL) {
++            NEXT_AREA(gc_sweep_prev) = NEXT_AREA(area);
++            mp_state_mem_area_t *next = NEXT_AREA(gc_sweep_prev);
++            MP_PLAT_FREE_HEAP(area);
++            gc_sweep_area = next;
++            gc_sweep_block = 0;
++            gc_sweep_free_tail = 0;
++            gc_sweep_last_used = 0;
++            continue;
++        }
++        #endif
++        gc_sweep_prev = area;
++        gc_sweep_area = NEXT_AREA(area);
++        gc_sweep_block = 0;
++        gc_sweep_free_tail = 0;
++        gc_sweep_last_used = 0;
++    }
++    gc_incremental_finish();
++}
++
++static void gc_incremental_mark(uint64_t t0) {
++    for (;;) {
++        if (gc_budget_exhausted(t0) && !gc_partial_active && gc_mark_sp == 0 && !gc_ovf_active && !MP_STATE_MEM(gc_stack_overflow)) {
++            // Nothing left, so the budget must not block the transition to sweep.
++            break;
++        }
++        if (gc_partial_active) {
++            if (gc_trace_block(gc_partial_area, gc_partial_block, gc_partial_word, t0)) {
++                return;
++            }
++            continue;
++        }
++        if (gc_mark_sp > 0) {
++            if (gc_budget_exhausted(t0)) {
++                return;
++            }
++            gc_mark_sp--;
++            size_t block = MP_STATE_MEM(gc_block_stack)[gc_mark_sp];
++            #if MICROPY_GC_SPLIT_HEAP
++            mp_state_mem_area_t *area = MP_STATE_MEM(gc_area_stack)[gc_mark_sp];
++            #else
++            mp_state_mem_area_t *area = &MP_STATE_MEM(area);
++            #endif
++            if (gc_trace_block(area, block, 0, t0)) {
++                return;
++            }
++            continue;
++        }
++        if (MP_STATE_MEM(gc_stack_overflow) || gc_ovf_active) {
++            if (gc_budget_exhausted(t0)) {
++                return;
++            }
++            gc_overflow_advance(t0);
++            gc_budget_tick();
++            continue;
++        }
++        break;
++    }
++    gc_incremental_start_sweep();
++}
++
++void gc_incremental_set_force(int on) {
++    if (on) {
++        mp_gc_slice_force = 1;
++        if (mp_gc_phase != 0) {
++            mp_gc_slice_stall = 1;
++        }
++    } else if (!mp_gc_slice_busy) {
++        mp_gc_slice_force = 0;
++    }
++}
++
++static void gc_collect_full_now(void) {
++    if (mp_gc_slice_busy) {
++        // The slice already on the stack must run to the end.
++        mp_gc_slice_force = 1;
++        mp_gc_slice_stall = 1;
++        return;
++    }
++    mp_gc_slice_force = 1;
++    gc_collect();
++    mp_gc_slice_force = 0;
++}
++
++void gc_incremental_collect(void (*extra_roots)(void)) {
++    if (mp_gc_slice_busy) {
++        if (mp_gc_slice_force) {
++            mp_gc_slice_stall = 1;
++        }
++        return;
++    }
++    mp_gc_slice_busy = 1;
++    gc_budget_ticks = 0;
++    uint64_t t0 = gc_now_us();
++    bool started = false;
++    if (mp_gc_phase == 0) {
++        gc_incremental_begin();
++        started = true;
++    }
++    gc_slice_count++;
++    if (started) {
++        gc_slice_log("start", "mark", 0);
++    }
++    if (mp_gc_phase == 1) {
++        uint64_t t_mark = gc_now_us();
++        gc_incremental_scan_vm_roots();
++        if (extra_roots != NULL) {
++            extra_roots();
++        }
++        gc_incremental_mark(t0);
++        gc_mark_us_acc += (uint32_t)(gc_now_us() - t_mark);
++    }
++    if (mp_gc_phase == 2) {
++        uint64_t t_sweep = gc_now_us();
++        gc_incremental_sweep(t0);
++        gc_sweep_us_acc += (uint32_t)(gc_now_us() - t_sweep);
++    }
++    uint64_t now = gc_now_us();
++    if (mp_gc_phase == 0) {
++        // Times include this slice. stall=yes only when a caller forced a full finish.
++        gc_slice_log("done", "idle", (uint32_t)(now - t0));
++    } else if (now - gc_slice_log_us >= 150000) {
++        gc_slice_log_us = now;
++        gc_slice_log("step", mp_gc_phase == 1 ? "mark" : "sweep", (uint32_t)(now - t0));
++    }
++    gc_slice_last_us = now;
++    mp_gc_slice_busy = 0;
++}
++
++void gc_incremental_poll(void) {
++    if (mp_gc_phase == 0 || mp_gc_slice_busy) {
++        return;
++    }
++    if (MP_STATE_THREAD(gc_lock_depth) != 0) {
++        return;
++    }
++    // Every 8th hook when a gap is configured, so a tight loop does not
++    // read the timer on every branch. A zero gap (host tests) runs each hook.
++    volatile uint32_t gap_us = MICROPY_GC_SLICE_GAP_US;
++    if (gap_us != 0) {
++        if ((++mp_gc_slice_div & 7) != 0) {
++            return;
++        }
++        if ((gc_now_us() - gc_slice_last_us) < (uint64_t)gap_us) {
++            return;
++        }
++    } else {
++        (void)mp_gc_slice_div;
++    }
++    gc_collect();
++}
++
++#endif // MICROPY_GC_INCREMENTAL
++
+ #endif // MICROPY_ENABLE_GC
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/gc.h /agent/repos/uiflow-micropython/micropython/py/gc.h
+--- micropython.orig/py/gc.h
++++ micropython/py/gc.h
+@@ -84,4 +84,14 @@
+ void gc_dump_info(const mp_print_t *print);
+ void gc_dump_alloc_table(const mp_print_t *print);
+ 
++#if MICROPY_GC_INCREMENTAL
++// One slice or a full finish, depending on gc_incremental_request_full().
++// extra_roots traces the C stack and registers; it may be NULL.
++void gc_incremental_collect(void (*extra_roots)(void));
++// Continue an in-progress collection from a VM safe point. No-op when idle.
++void gc_incremental_poll(void);
++// When on, the next gc_collect() runs the open cycle to the end.
++void gc_incremental_set_force(int on);
++#endif
++
+ #endif // MICROPY_INCLUDED_PY_GC_H
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/map.c /agent/repos/uiflow-micropython/micropython/py/map.c
+--- micropython.orig/py/map.c
++++ micropython/py/map.c
+@@ -141,7 +141,7 @@
+     map->table = new_table;
+     for (size_t i = 0; i < old_alloc; i++) {
+         if (old_table[i].key != MP_OBJ_NULL && old_table[i].key != MP_OBJ_SENTINEL) {
+-            mp_map_lookup(map, old_table[i].key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = old_table[i].value;
++            GC_STORE(mp_map_lookup(map, old_table[i].key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value, old_table[i].value);
+         }
+     }
+     m_del(mp_map_elem_t, old_table, old_alloc);
+@@ -202,7 +202,7 @@
+                     // note: caller must NULL the value so the GC can clean up (e.g. see dict_get_helper).
+                     elem = &map->table[map->used];
+                     elem->key = MP_OBJ_NULL;
+-                    elem->value = value;
++                    GC_STORE(elem->value, value);
+                 }
+                 #endif
+                 MAP_CACHE_SET(index, elem - map->table);
+@@ -220,7 +220,7 @@
+             mp_seq_clear(map->table, map->used, map->alloc, sizeof(*map->table));
+         }
+         mp_map_elem_t *elem = map->table + map->used++;
+-        elem->key = index;
++        GC_STORE(elem->key, index);
+         elem->value = MP_OBJ_NULL;
+         if (!mp_obj_is_qstr(index)) {
+             map->all_keys_are_qstrs = 0;
+@@ -261,7 +261,7 @@
+                 if (avail_slot == NULL) {
+                     avail_slot = slot;
+                 }
+-                avail_slot->key = index;
++                GC_STORE(avail_slot->key, index);
+                 avail_slot->value = MP_OBJ_NULL;
+                 if (!mp_obj_is_qstr(index)) {
+                     map->all_keys_are_qstrs = 0;
+@@ -302,7 +302,7 @@
+                 if (avail_slot != NULL) {
+                     // there was an available slot, so use that
+                     map->used++;
+-                    avail_slot->key = index;
++                    GC_STORE(avail_slot->key, index);
+                     avail_slot->value = MP_OBJ_NULL;
+                     if (!mp_obj_is_qstr(index)) {
+                         map->all_keys_are_qstrs = 0;
+@@ -370,7 +370,7 @@
+                     avail_slot = &set->table[pos];
+                 }
+                 set->used++;
+-                *avail_slot = index;
++                GC_STORE(*avail_slot, index);
+                 return index;
+             } else {
+                 return MP_OBJ_NULL;
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/modgc.c /agent/repos/uiflow-micropython/micropython/py/modgc.c
+--- micropython.orig/py/modgc.c
++++ micropython/py/modgc.c
+@@ -30,7 +30,23 @@
+ 
+ #if MICROPY_PY_GC && MICROPY_ENABLE_GC
+ 
+-// collect(): run a garbage collection
++// collect(): run a garbage collection.
++// On a sliced build, no argument does one slice. A true argument finishes.
++#if MICROPY_GC_INCREMENTAL
++static mp_obj_t py_gc_collect(size_t n_args, const mp_obj_t *args) {
++    if (n_args > 0 && mp_obj_is_true(args[0])) {
++        gc_incremental_set_force(1);
++    }
++    gc_collect();
++    gc_incremental_set_force(0);
++    #if MICROPY_PY_GC_COLLECT_RETVAL
++    return MP_OBJ_NEW_SMALL_INT(MP_STATE_MEM(gc_collected));
++    #else
++    return mp_const_none;
++    #endif
++}
++MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc_collect_obj, 0, 1, py_gc_collect);
++#else
+ static mp_obj_t py_gc_collect(void) {
+     gc_collect();
+     #if MICROPY_PY_GC_COLLECT_RETVAL
+@@ -40,6 +56,7 @@
+     #endif
+ }
+ MP_DEFINE_CONST_FUN_OBJ_0(gc_collect_obj, py_gc_collect);
++#endif
+ 
+ // disable(): disable the garbage collector
+ static mp_obj_t gc_disable(void) {
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/mpconfig.h /agent/repos/uiflow-micropython/micropython/py/mpconfig.h
+--- micropython.orig/py/mpconfig.h
++++ micropython/py/mpconfig.h
+@@ -281,6 +281,35 @@
+ #define MICROPY_GC_ALLOC_THRESHOLD (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_CORE_FEATURES)
+ #endif
+ 
++// Slice an explicit gc.collect() across later VM turns so one call does not
++// walk the whole heap. gc_alloc still finishes a collection before it fails.
++// 0 keeps the historical stop-the-world collect.
++#ifndef MICROPY_GC_INCREMENTAL
++#define MICROPY_GC_INCREMENTAL (0)
++#endif
++
++// Wall time of one slice. 0 means "no time cap" (block cap still applies).
++#ifndef MICROPY_GC_SLICE_BUDGET_US
++#define MICROPY_GC_SLICE_BUDGET_US (3000)
++#endif
++
++// Minimum gap between slices started from the VM hook. 0 runs a slice on
++// every hook, which host tests use to interleave the mutator.
++#ifndef MICROPY_GC_SLICE_GAP_US
++#define MICROPY_GC_SLICE_GAP_US (12000)
++#endif
++
++// Pointer-words traced per slice. 0 means the time budget alone stops a slice.
++#ifndef MICROPY_GC_SLICE_BUDGET_BLOCKS
++#define MICROPY_GC_SLICE_BUDGET_BLOCKS (0)
++#endif
++
++// Before sweeping, abort if a marked object points at an unmarked head.
++// Host tests turn this on. It is a full extra scan, so firmware leaves it off.
++#ifndef MICROPY_GC_INCREMENTAL_VERIFY
++#define MICROPY_GC_INCREMENTAL_VERIFY (0)
++#endif
++
+ // Number of bytes to allocate initially when creating new chunks to store
+ // interned string data.  Smaller numbers lead to more chunks being needed
+ // and more wastage at the end of the chunk.  Larger numbers lead to wasted
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objattrtuple.c /agent/repos/uiflow-micropython/micropython/py/objattrtuple.c
+--- micropython.orig/py/objattrtuple.c
++++ micropython/py/objattrtuple.c
+@@ -74,9 +74,9 @@
+     mp_obj_tuple_t *o = mp_obj_malloc_var(mp_obj_tuple_t, items, mp_obj_t, n + 1, &mp_type_attrtuple);
+     o->len = n;
+     for (size_t i = 0; i < n; i++) {
+-        o->items[i] = items[i];
++        GC_STORE(o->items[i], items[i]);
+     }
+-    o->items[n] = MP_OBJ_FROM_PTR(fields);
++    GC_STORE(o->items[n], MP_OBJ_FROM_PTR(fields));
+     return MP_OBJ_FROM_PTR(o);
+ }
+ 
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objcell.c /agent/repos/uiflow-micropython/micropython/py/objcell.c
+--- micropython.orig/py/objcell.c
++++ micropython/py/objcell.c
+@@ -54,6 +54,6 @@
+ 
+ mp_obj_t mp_obj_new_cell(mp_obj_t obj) {
+     mp_obj_cell_t *o = mp_obj_malloc(mp_obj_cell_t, &mp_type_cell);
+-    o->obj = obj;
++    GC_STORE(o->obj, obj);
+     return MP_OBJ_FROM_PTR(o);
+ }
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objdeque.c /agent/repos/uiflow-micropython/micropython/py/objdeque.c
+--- micropython.orig/py/objdeque.c
++++ micropython/py/objdeque.c
+@@ -108,7 +108,7 @@
+         mp_raise_msg(&mp_type_IndexError, MP_ERROR_TEXT("full"));
+     }
+ 
+-    self->items[self->i_put] = arg;
++    GC_STORE(self->items[self->i_put], arg);
+     self->i_put = new_i_put;
+ 
+     if (self->i_get == new_i_put) {
+@@ -134,7 +134,7 @@
+     }
+ 
+     self->i_get = new_i_get;
+-    self->items[self->i_get] = arg;
++    GC_STORE(self->items[self->i_get], arg);
+ 
+     // overwriting first element in deque
+     if (self->i_put == new_i_get) {
+@@ -217,7 +217,7 @@
+         return self->items[index_val];
+     } else {
+         // store into deque
+-        self->items[index_val] = value;
++        GC_STORE(self->items[index_val], value);
+         return mp_const_none;
+     }
+ }
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objdict.c /agent/repos/uiflow-micropython/micropython/py/objdict.c
+--- micropython.orig/py/objdict.c
++++ micropython/py/objdict.c
+@@ -297,7 +297,7 @@
+ 
+     mp_obj_dict_t *self = MP_OBJ_TO_PTR(self_out);
+     while ((next = mp_iternext(iter)) != MP_OBJ_STOP_ITERATION) {
+-        mp_map_lookup(&self->map, next, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = value;
++        GC_STORE(mp_map_lookup(&self->map, next, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value, value);
+     }
+ 
+     return self_out;
+@@ -325,7 +325,7 @@
+             value = args[2];
+         }
+         if (lookup_kind == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
+-            elem->value = value;
++            GC_STORE(elem->value, value);
+         }
+     } else {
+         value = elem->value;
+@@ -392,7 +392,7 @@
+                 size_t cur = 0;
+                 mp_map_elem_t *elem = NULL;
+                 while ((elem = dict_iter_next((mp_obj_dict_t *)MP_OBJ_TO_PTR(args[1]), &cur)) != NULL) {
+-                    mp_map_lookup(&self->map, elem->key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = elem->value;
++                    GC_STORE(mp_map_lookup(&self->map, elem->key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value, elem->value);
+                 }
+             }
+         } else {
+@@ -409,7 +409,7 @@
+                     || stop != MP_OBJ_STOP_ITERATION) {
+                     mp_raise_ValueError(MP_ERROR_TEXT("dict update sequence has wrong length"));
+                 } else {
+-                    mp_map_lookup(&self->map, key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = value;
++                    GC_STORE(mp_map_lookup(&self->map, key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value, value);
+                 }
+             }
+         }
+@@ -418,7 +418,7 @@
+     // update the dict with any keyword args
+     for (size_t i = 0; i < kwargs->alloc; i++) {
+         if (mp_map_slot_is_filled(kwargs, i)) {
+-            mp_map_lookup(&self->map, kwargs->table[i].key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = kwargs->table[i].value;
++            GC_STORE(mp_map_lookup(&self->map, kwargs->table[i].key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value, kwargs->table[i].value);
+         }
+     }
+ 
+@@ -661,7 +661,7 @@
+     mp_check_self(mp_obj_is_dict_or_ordereddict(self_in));
+     mp_obj_dict_t *self = MP_OBJ_TO_PTR(self_in);
+     mp_ensure_not_fixed(self);
+-    mp_map_lookup(&self->map, key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = value;
++    GC_STORE(mp_map_lookup(&self->map, key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value, value);
+     return self_in;
+ }
+ 
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objfun.c /agent/repos/uiflow-micropython/micropython/py/objfun.c
+--- micropython.orig/py/objfun.c
++++ micropython/py/objfun.c
+@@ -432,10 +432,12 @@
+     o->context = context;
+     o->child_table = child_table;
+     if (def_pos_args != NULL) {
+-        memcpy(o->extra_args, def_pos_args->items, n_def_args * sizeof(mp_obj_t));
++        for (size_t i = 0; i < n_def_args; i++) {
++            GC_STORE(o->extra_args[i], def_pos_args->items[i]);
++        }
+     }
+     if (def_kw_args != MP_OBJ_NULL) {
+-        o->extra_args[n_def_args] = def_kw_args;
++        GC_STORE(o->extra_args[n_def_args], def_kw_args);
+     }
+     return MP_OBJ_FROM_PTR(o);
+ }
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/obj.h /agent/repos/uiflow-micropython/micropython/py/obj.h
+--- micropython.orig/py/obj.h
++++ micropython/py/obj.h
+@@ -1089,9 +1089,31 @@
+     return self->obj;
+ }
+ 
++#if MICROPY_GC_INCREMENTAL
++// 0 idle, 1 marking, 2 sweeping. The fast path is a single load.
++extern volatile uint8_t mp_gc_phase;
++void gc_write_barrier_slow(mp_obj_t o);
++static inline void gc_write_barrier(mp_obj_t o) {
++    if (mp_gc_phase == 1) {
++        gc_write_barrier_slow(o);
++    }
++}
++#else
++static inline void gc_write_barrier(mp_obj_t o) {
++    (void)o;
++}
++#endif
++
++// Shade the new pointer, then store it. Removing a pointer does not need this.
++#define GC_STORE(dest, value) \
++    do { \
++        gc_write_barrier(value); \
++        (dest) = (value); \
++    } while (0)
++
+ static inline void mp_obj_cell_set(mp_obj_t self_in, mp_obj_t obj) {
+     mp_obj_cell_t *self = (mp_obj_cell_t *)MP_OBJ_TO_PTR(self_in);
+-    self->obj = obj;
++    GC_STORE(self->obj, obj);
+ }
+ 
+ // int
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objlist.c /agent/repos/uiflow-micropython/micropython/py/objlist.c
+--- micropython.orig/py/objlist.c
++++ micropython/py/objlist.c
+@@ -233,7 +233,7 @@
+         self->alloc *= 2;
+         mp_seq_clear(self->items, self->len + 1, self->alloc, sizeof(*self->items));
+     }
+-    self->items[self->len++] = arg;
++    GC_STORE(self->items[self->len++], arg);
+     return mp_const_none; // return None, as per CPython
+ }
+ 
+@@ -250,7 +250,9 @@
+             mp_seq_clear(self->items, self->len + arg->len, self->alloc, sizeof(*self->items));
+         }
+ 
+-        memcpy(self->items + self->len, arg->items, sizeof(mp_obj_t) * arg->len);
++        for (size_t i = 0; i < arg->len; i++) {
++            GC_STORE(self->items[self->len + i], arg->items[i]);
++        }
+         self->len += arg->len;
+     } else {
+         list_extend_from_iter(self_in, arg_in);
+@@ -395,7 +397,7 @@
+     for (mp_int_t i = self->len - 1; i > index; i--) {
+         self->items[i] = self->items[i - 1];
+     }
+-    self->items[index] = obj;
++    GC_STORE(self->items[index], obj);
+ 
+     return mp_const_none;
+ }
+@@ -483,7 +485,7 @@
+     mp_obj_list_t *o = list_new(n);
+     if (items != NULL) {
+         for (size_t i = 0; i < n; i++) {
+-            o->items[i] = items[i];
++            GC_STORE(o->items[i], items[i]);
+         }
+     }
+     return MP_OBJ_FROM_PTR(o);
+@@ -505,7 +507,7 @@
+ void mp_obj_list_store(mp_obj_t self_in, mp_obj_t index, mp_obj_t value) {
+     mp_obj_list_t *self = MP_OBJ_TO_PTR(self_in);
+     size_t i = mp_get_index(self->base.type, self->len, index, false);
+-    self->items[i] = value;
++    GC_STORE(self->items[i], value);
+ }
+ 
+ /******************************************************************************/
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objmodule.c /agent/repos/uiflow-micropython/micropython/py/objmodule.c
+--- micropython.orig/py/objmodule.c
++++ micropython/py/objmodule.c
+@@ -137,7 +137,7 @@
+     mp_obj_dict_store(MP_OBJ_FROM_PTR(o->module.globals), MP_OBJ_NEW_QSTR(MP_QSTR___name__), MP_OBJ_NEW_QSTR(module_name));
+ 
+     // store the new module into the slot in the global dict holding all modules
+-    el->value = MP_OBJ_FROM_PTR(o);
++    GC_STORE(el->value, MP_OBJ_FROM_PTR(o));
+ 
+     // return the new module
+     return MP_OBJ_FROM_PTR(o);
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objnamedtuple.c /agent/repos/uiflow-micropython/micropython/py/objnamedtuple.c
+--- micropython.orig/py/objnamedtuple.c
++++ micropython/py/objnamedtuple.c
+@@ -136,7 +136,7 @@
+                 MP_ERROR_TEXT("function got multiple values for argument '%q'"), kw);
+             #endif
+         }
+-        tuple->items[id] = args[i + 1];
++        GC_STORE(tuple->items[id], args[i + 1]);
+     }
+ 
+     return MP_OBJ_FROM_PTR(tuple);
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objobject.c /agent/repos/uiflow-micropython/micropython/py/objobject.c
+--- micropython.orig/py/objobject.c
++++ micropython/py/objobject.c
+@@ -72,7 +72,7 @@
+     }
+ 
+     mp_obj_instance_t *self = MP_OBJ_TO_PTR(self_in);
+-    mp_map_lookup(&self->members, attr, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = value;
++    GC_STORE(mp_map_lookup(&self->members, attr, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value, value);
+     return mp_const_none;
+ }
+ static MP_DEFINE_CONST_FUN_OBJ_3(object___setattr___obj, object___setattr__);
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objtuple.c /agent/repos/uiflow-micropython/micropython/py/objtuple.c
+--- micropython.orig/py/objtuple.c
++++ micropython/py/objtuple.c
+@@ -245,7 +245,7 @@
+     o->len = n;
+     if (items) {
+         for (size_t i = 0; i < n; i++) {
+-            o->items[i] = items[i];
++            GC_STORE(o->items[i], items[i]);
+         }
+     }
+     return MP_OBJ_FROM_PTR(o);
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/objtype.c /agent/repos/uiflow-micropython/micropython/py/objtype.c
+--- micropython.orig/py/objtype.c
++++ micropython/py/objtype.c
+@@ -806,7 +806,7 @@
+         return elem != NULL;
+     } else {
+         // store attribute
+-        mp_map_lookup(&self->members, MP_OBJ_NEW_QSTR(attr), MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = value;
++        GC_STORE(mp_map_lookup(&self->members, MP_OBJ_NEW_QSTR(attr), MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value, value);
+         return true;
+     }
+ }
+@@ -1148,7 +1148,7 @@
+ 
+                 // store attribute
+                 mp_map_elem_t *elem = mp_map_lookup(locals_map, MP_OBJ_NEW_QSTR(attr), MP_MAP_LOOKUP_ADD_IF_NOT_FOUND);
+-                elem->value = dest[1];
++                GC_STORE(elem->value, dest[1]);
+                 dest[0] = MP_OBJ_NULL; // indicate success
+             }
+         }
+diff -ruN '--exclude=.git' '--exclude=lib' '--exclude=build-standard' '--exclude=build-stock' '--exclude=build' '--exclude=mpy-cross' '--exclude=tests' /tmp/mpy-base/py/parse.c /agent/repos/uiflow-micropython/micropython/py/parse.c
+--- micropython.orig/py/parse.c
++++ micropython/py/parse.c
+@@ -847,7 +847,7 @@
+                 // store the value in the table of dynamic constants
+                 mp_map_elem_t *elem = mp_map_lookup(&parser->consts, MP_OBJ_NEW_QSTR(id), MP_MAP_LOOKUP_ADD_IF_NOT_FOUND);
+                 assert(elem->value == MP_OBJ_NULL);
+-                elem->value = value;
++                GC_STORE(elem->value, value);
+ 
+                 // If the constant starts with an underscore then treat it as a private
+                 // variable and don't emit any code to store the value to the id.
