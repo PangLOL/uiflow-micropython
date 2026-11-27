@@ -175,12 +175,17 @@ Index: micropython/ports/esp32/mphalport.c
 ===================================================================
 --- micropython.orig/ports/esp32/mphalport.c
 +++ micropython/ports/esp32/mphalport.c
-@@ -142,6 +142,44 @@
+@@ -142,6 +142,49 @@
      }
  }
  
++#ifndef MICROPY_GC_PAUSE_LOG
++#define MICROPY_GC_PAUSE_LOG (0)
++#endif
++
 +int mp_hal_gc_log_ready(void) {
-+    #if MICROPY_HW_USB_CDC && !defined(NO_QSTR)
++    // pause gcamt / pause gcsli stay off unless a debug build sets the flag.
++    #if MICROPY_GC_PAUSE_LOG && MICROPY_HW_USB_CDC && !defined(NO_QSTR)
 +    return tusb_inited();
 +    #else
 +    return 0;
@@ -224,14 +229,15 @@ Index: micropython/ports/esp32/mphalport.h
 ===================================================================
 --- micropython.orig/ports/esp32/mphalport.h
 +++ micropython/ports/esp32/mphalport.h
-@@ -111,6 +111,13 @@
+@@ -111,6 +111,14 @@
  void mp_hal_wake_main_task(void);
  void mp_hal_wake_main_task_from_isr(void);
  
-+// Non-allocating USB CDC write for the GC threshold trace in py/gc.c.
-+// mp_hal_gc_log_ready() is true only after TinyUSB is initialised.
-+// mp_hal_gc_log_write() copies into the CDC FIFO and flushes. It does not
-+// allocate, call into Python, wait on the host, or run the scheduler.
++// Non-allocating USB CDC write for the GC pause traces in py/gc.c.
++// mp_hal_gc_log_ready() is false unless MICROPY_GC_PAUSE_LOG is 1, and then
++// only after TinyUSB is initialised. mp_hal_gc_log_write() copies into the
++// CDC FIFO and flushes. It does not allocate, call into Python, wait on the
++// host, or run the scheduler.
 +int mp_hal_gc_log_ready(void);
 +void mp_hal_gc_log_write(const char *str, size_t len);
 +
